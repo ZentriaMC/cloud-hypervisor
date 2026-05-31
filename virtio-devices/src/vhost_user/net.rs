@@ -401,6 +401,20 @@ impl VirtioDevice for Net {
             pause_evt,
         )?;
 
+        // vu_common.activate enables every configured data vring. Per
+        // virtio 1.0+ §5.1.6.5.5 multiqueue is disabled by default, so
+        // disable everything past the first pair; multi-queue guests
+        // grow it back via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, single-queue
+        // and pre-MQ drivers see the spec-required initial state.
+        if let Some(vu) = self.vu_common.vu.as_ref() {
+            VhostUserMqBackend::new(vu.clone(), self.vu_common.vu_num_queues)
+                .set_active_pairs(1)
+                .map_err(|e| {
+                    error!("Failed to disable extra vhost-user data vrings: {e}");
+                    crate::ActivateError::BadActivate
+                })?;
+        }
+
         let paused = self.vu_common.virtio_common.paused.clone();
         let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
 
