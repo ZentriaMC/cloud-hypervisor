@@ -417,11 +417,27 @@ pub struct Net {
     /// ends from re-issuing `TUNSETQUEUE` on queues already in the
     /// requested state, which the kernel would reject with `EINVAL`.
     kernel_active_pairs: Arc<AtomicU16>,
-    /// Pair count to align to on the *next* activation, populated from
-    /// `NetState::active_pairs` when restoring from a snapshot and
-    /// consumed by the first `activate()` so subsequent reset cycles
-    /// fall back to the spec default of one.
-    restore_active_pairs: Option<u16>,
+    /// What the next `activate()` should align the kernel-side tap
+    /// queue count to. Defaults to `ColdBoot` for fresh devices and
+    /// gets reset to `ColdBoot` after each activation, so only the
+    /// first activate post-restore deviates from the spec default.
+    next_activation_target: ActivationTarget,
+}
+
+/// Target queue-pair count for the next `Net::activate()` call.
+#[derive(Debug, Clone, Copy)]
+enum ActivationTarget {
+    /// Spec default: one active pair (cold boot, plus any non-first
+    /// activate after restore).
+    ColdBoot,
+    /// First activate after restoring from a snapshot that pre-dates
+    /// the `NetState::active_pairs` field. The pre-snapshot CH version
+    /// left every tap attached, so mimic that to avoid silently losing
+    /// multi-queue across the upgrade.
+    LegacyRestore,
+    /// First activate after restoring from a snapshot that recorded
+    /// the active pair count.
+    RestoreWith(u16),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -466,16 +482,20 @@ impl Net {
             }
         };
 
-        let (avail_features, acked_features, config, queue_sizes, paused, restore_active_pairs) =
+        let (avail_features, acked_features, config, queue_sizes, paused, next_activation_target) =
             if let Some(state) = state {
                 info!("Restoring virtio-net {id}");
+                let target = match state.active_pairs {
+                    Some(n) => ActivationTarget::RestoreWith(n),
+                    None => ActivationTarget::LegacyRestore,
+                };
                 (
                     state.avail_features,
                     state.acked_features,
                     state.config,
                     state.queue_size,
                     true,
-                    state.active_pairs,
+                    target,
                 )
             } else {
                 let mut avail_features = (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << VIRTIO_F_VERSION_1);
@@ -530,7 +550,7 @@ impl Net {
                     config,
                     vec![queue_size; queue_num],
                     false,
-                    None,
+                    ActivationTarget::ColdBoot,
                 )
             };
 
@@ -556,7 +576,7 @@ impl Net {
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
             kernel_active_pairs,
-            restore_active_pairs,
+            next_activation_target,
         })
     }
 
@@ -738,12 +758,20 @@ impl VirtioDevice for Net {
 
         // Default to one attached tap queue pair per virtio 1.0+
         // §5.1.6.5.5 (multiqueue disabled until the guest enables it).
-        // On the first activation after a snapshot restore, jump
-        // straight to the pre-snapshot pair count instead -- the guest
-        // hasn't been through a reset/MQ-negotiation cycle and still
-        // expects its previous active set. Subsequent reset cycles in
-        // the restored VM fall back to the default of one.
-        let target_pairs = self.restore_active_pairs.take().unwrap_or(1);
+        // Restores deviate: a snapshot that recorded its active pair
+        // count is replayed at that count, and a pre-Rev-G snapshot
+        // (no recorded count) falls back to leaving every tap attached
+        // -- matching the broken-but-multi-queue-preserving behavior
+        // of the CH version that wrote the snapshot, so the upgrade
+        // doesn't silently lose pairs. The target is reset to
+        // `ColdBoot` so reset/re-activate cycles inside the restored
+        // VM go through the spec-correct one-pair path.
+        let target_pairs = match self.next_activation_target {
+            ActivationTarget::ColdBoot => 1,
+            ActivationTarget::LegacyRestore => self.taps.len() as u16,
+            ActivationTarget::RestoreWith(n) => n,
+        };
+        self.next_activation_target = ActivationTarget::ColdBoot;
         TapMqBackend::new(self.taps.clone(), self.kernel_active_pairs.clone())
             .set_active_pairs(target_pairs)
             .map_err(|e| {
