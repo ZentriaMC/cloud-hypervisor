@@ -20,8 +20,8 @@ use log::{debug, error, info, warn};
 #[cfg(not(fuzzing))]
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
-    CtrlQueue, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TapError, TxVirtio,
-    VirtioNetConfig, align_kernel_queue_pairs, build_net_config_space,
+    CtrlQueue, MacAddr, MqBackend, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap,
+    TapError, TapMqBackend, TxVirtio, VirtioNetConfig, build_net_config_space,
     build_net_config_space_with_mq, open_tap,
 };
 use seccompiler::SeccompAction;
@@ -716,17 +716,20 @@ impl VirtioDevice for Net {
         let qp_threads = (num_queues - ctrl_threads) / 2;
         self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
 
-        // Start each activation with one attached tap queue pair, matching
-        // QEMU's virtio-net model. Multi-queue guests negotiate
-        // VIRTIO_NET_F_MQ and grow the count via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET;
-        // this also covers single-queue drivers that never negotiate F_MQ,
-        // where leaving all taps attached would otherwise let the kernel
-        // steer RX to queues with no userspace reader (silently dropping
-        // hashed traffic at the tap).
-        align_kernel_queue_pairs(&self.taps, &self.kernel_active_pairs, 1).map_err(|e| {
-            error!("Failed to align tap queues to single active pair: {e}");
-            ActivateError::BadActivate
-        })?;
+        // Start each activation with one attached tap queue pair (per
+        // virtio 1.0+ §5.1.6.5.5: multiqueue is disabled by default).
+        // Multi-queue guests negotiate VIRTIO_NET_F_MQ and grow the count
+        // via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET; this also covers
+        // single-queue drivers that never negotiate F_MQ, where leaving
+        // all taps attached would otherwise let the kernel steer RX to
+        // queues with no userspace reader (silently dropping hashed
+        // traffic at the tap).
+        TapMqBackend::new(self.taps.clone(), self.kernel_active_pairs.clone())
+            .set_active_pairs(1)
+            .map_err(|e| {
+                error!("Failed to align tap queues to single active pair: {e}");
+                ActivateError::BadActivate
+            })?;
 
         if has_ctrl_queue {
             let ctrl_queue_index = num_queues - 1;
@@ -741,7 +744,10 @@ impl VirtioDevice for Net {
                 pause_evt,
                 ctrl_q: CtrlQueue::new(
                     self.taps.clone(),
-                    Some(self.kernel_active_pairs.clone()),
+                    Some(Box::new(TapMqBackend::new(
+                        self.taps.clone(),
+                        self.kernel_active_pairs.clone(),
+                    ))),
                     self.taps.len() as u16,
                     self.common.feature_acked(VIRTIO_NET_F_MQ.into()),
                 ),
