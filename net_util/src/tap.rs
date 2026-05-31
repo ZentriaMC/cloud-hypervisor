@@ -461,6 +461,32 @@ impl Tap {
         }
     }
 
+    /// Attach or detach this tap from the underlying multi-queue tun.
+    ///
+    /// Only meaningful for taps opened with `IFF_MULTI_QUEUE` (i.e.
+    /// `num_queue_pairs > 1`). When detached, the kernel's `tun_select_queue()`
+    /// stops steering inbound packets to this fd, so the corresponding RX
+    /// virtqueue receives nothing.
+    ///
+    /// Used to honour `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` from the guest and to
+    /// disable queue pairs the guest never activated -- without this, kernel
+    /// queue-selection keeps sharing RX across all bound tap fds even when
+    /// only some of them have an active worker on the userspace side.
+    pub fn set_queue(&self, attach: bool) -> Result<()> {
+        let ifru_flags = if attach {
+            libc::IFF_ATTACH_QUEUE
+        } else {
+            libc::IFF_DETACH_QUEUE
+        } as c_short;
+        let ifreq = libc::ifreq {
+            ifr_name: [0; libc::IFNAMSIZ],
+            ifr_ifru: __c_anonymous_ifr_ifru { ifru_flags },
+        };
+        // SAFETY: IOCTL with correct arguments -- ifreq is a kernel-defined
+        // struct and we pass a valid tap fd.
+        unsafe { Self::ioctl_with_ref(&self.tap_file, libc::TUNSETQUEUE as c_ulong, &ifreq) }
+    }
+
     /// Enable the tap interface.
     pub fn enable(&self) -> Result<()> {
         let sock = create_unix_socket().map_err(Error::NetUtil)?;
