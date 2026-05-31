@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{result, thread};
 
@@ -20,8 +20,9 @@ use log::{debug, error, info, warn};
 #[cfg(not(fuzzing))]
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
-    CtrlQueue, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TapError, TxVirtio,
-    VirtioNetConfig, build_net_config_space, build_net_config_space_with_mq, open_tap,
+    CtrlQueue, MacAddr, MqBackend, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap,
+    TapError, TapMqBackend, TxVirtio, VirtioNetConfig, build_net_config_space,
+    build_net_config_space_with_mq, open_tap,
 };
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
@@ -406,6 +407,37 @@ pub struct Net {
     rate_limiter_config: Option<RateLimiterConfig>,
     exit_evt: EventFd,
     device_status: Arc<AtomicU8>,
+    /// Number of queue pairs currently attached to the underlying
+    /// multi-queue tun. `open_tap`/`from_tap_fd` start with every tap
+    /// kernel-attached via `IFF_MULTI_QUEUE`, so the initial value matches
+    /// `taps.len()`. `activate()` then drives it down to the target pair
+    /// count (`1` for cold boot, the snapshotted count for restore), and
+    /// the spawned `CtrlQueue` worker grows it back in response to
+    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`. Sharing the tracker keeps both
+    /// ends from re-issuing `TUNSETQUEUE` on queues already in the
+    /// requested state, which the kernel would reject with `EINVAL`.
+    kernel_active_pairs: Arc<AtomicU16>,
+    /// What the next `activate()` should align the kernel-side tap
+    /// queue count to. Defaults to `ColdBoot` for fresh devices and
+    /// gets reset to `ColdBoot` after each activation, so only the
+    /// first activate post-restore deviates from the spec default.
+    next_activation_target: ActivationTarget,
+}
+
+/// Target queue-pair count for the next `Net::activate()` call.
+#[derive(Debug, Clone, Copy)]
+enum ActivationTarget {
+    /// Spec default: one active pair (cold boot, plus any non-first
+    /// activate after restore).
+    ColdBoot,
+    /// First activate after restoring from a snapshot that pre-dates
+    /// the `NetState::active_pairs` field. The pre-snapshot CH version
+    /// left every tap attached, so mimic that to avoid silently losing
+    /// multi-queue across the upgrade.
+    LegacyRestore,
+    /// First activate after restoring from a snapshot that recorded
+    /// the active pair count.
+    RestoreWith(u16),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -414,6 +446,11 @@ pub struct NetState {
     pub acked_features: u64,
     pub config: VirtioNetConfig,
     pub queue_size: Vec<u16>,
+    /// Active RX/TX queue-pair count at snapshot time. `None` on old
+    /// snapshots that pre-date this field; restore then falls back to
+    /// the spec default of one active pair.
+    #[serde(default)]
+    pub active_pairs: Option<u16>,
 }
 
 impl Net {
@@ -445,67 +482,79 @@ impl Net {
             }
         };
 
-        let (avail_features, acked_features, config, queue_sizes, paused) = if let Some(state) =
-            state
-        {
-            info!("Restoring virtio-net {id}");
-            (
-                state.avail_features,
-                state.acked_features,
-                state.config,
-                state.queue_size,
-                true,
-            )
-        } else {
-            let mut avail_features = (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << VIRTIO_F_VERSION_1);
-
-            if mtu.is_some() {
-                avail_features |= 1 << VIRTIO_NET_F_MTU;
-            }
-
-            if access_platform_enabled {
-                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-            }
-
-            // Configure TSO/UFO features when hardware checksum offload is enabled.
-            if offload_csum {
-                avail_features |= (1 << VIRTIO_NET_F_CSUM)
-                    | (1 << VIRTIO_NET_F_GUEST_CSUM)
-                    | (1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS);
-
-                if offload_tso {
-                    avail_features |= (1 << VIRTIO_NET_F_HOST_ECN)
-                        | (1 << VIRTIO_NET_F_HOST_TSO4)
-                        | (1 << VIRTIO_NET_F_HOST_TSO6)
-                        | (1 << VIRTIO_NET_F_GUEST_ECN)
-                        | (1 << VIRTIO_NET_F_GUEST_TSO4)
-                        | (1 << VIRTIO_NET_F_GUEST_TSO6);
-                }
-
-                if offload_ufo {
-                    avail_features |= (1 << VIRTIO_NET_F_HOST_UFO) | (1 << VIRTIO_NET_F_GUEST_UFO);
-                }
-            }
-
-            avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
-            let queue_num = num_queues + 1;
-
-            let mut config = VirtioNetConfig::default();
-            if let Some(mac) = guest_mac {
-                build_net_config_space(&mut config, mac, num_queues, mtu, &mut avail_features);
+        let (avail_features, acked_features, config, queue_sizes, paused, next_activation_target) =
+            if let Some(state) = state {
+                info!("Restoring virtio-net {id}");
+                let target = match state.active_pairs {
+                    Some(n) => ActivationTarget::RestoreWith(n),
+                    None => ActivationTarget::LegacyRestore,
+                };
+                (
+                    state.avail_features,
+                    state.acked_features,
+                    state.config,
+                    state.queue_size,
+                    true,
+                    target,
+                )
             } else {
-                build_net_config_space_with_mq(&mut config, num_queues, mtu, &mut avail_features);
-            }
+                let mut avail_features = (1 << VIRTIO_RING_F_EVENT_IDX) | (1 << VIRTIO_F_VERSION_1);
 
-            (
-                avail_features,
-                0,
-                config,
-                vec![queue_size; queue_num],
-                false,
-            )
-        };
+                if mtu.is_some() {
+                    avail_features |= 1 << VIRTIO_NET_F_MTU;
+                }
 
+                if access_platform_enabled {
+                    avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+                }
+
+                // Configure TSO/UFO features when hardware checksum offload is enabled.
+                if offload_csum {
+                    avail_features |= (1 << VIRTIO_NET_F_CSUM)
+                        | (1 << VIRTIO_NET_F_GUEST_CSUM)
+                        | (1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS);
+
+                    if offload_tso {
+                        avail_features |= (1 << VIRTIO_NET_F_HOST_ECN)
+                            | (1 << VIRTIO_NET_F_HOST_TSO4)
+                            | (1 << VIRTIO_NET_F_HOST_TSO6)
+                            | (1 << VIRTIO_NET_F_GUEST_ECN)
+                            | (1 << VIRTIO_NET_F_GUEST_TSO4)
+                            | (1 << VIRTIO_NET_F_GUEST_TSO6);
+                    }
+
+                    if offload_ufo {
+                        avail_features |=
+                            (1 << VIRTIO_NET_F_HOST_UFO) | (1 << VIRTIO_NET_F_GUEST_UFO);
+                    }
+                }
+
+                avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
+                let queue_num = num_queues + 1;
+
+                let mut config = VirtioNetConfig::default();
+                if let Some(mac) = guest_mac {
+                    build_net_config_space(&mut config, mac, num_queues, mtu, &mut avail_features);
+                } else {
+                    build_net_config_space_with_mq(
+                        &mut config,
+                        num_queues,
+                        mtu,
+                        &mut avail_features,
+                    );
+                }
+
+                (
+                    avail_features,
+                    0,
+                    config,
+                    vec![queue_size; queue_num],
+                    false,
+                    ActivationTarget::ColdBoot,
+                )
+            };
+
+        let kernel_active_pairs = Arc::new(AtomicU16::new(taps.len() as u16));
         Ok(Net {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Net as u32,
@@ -526,6 +575,8 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
+            kernel_active_pairs,
+            next_activation_target,
         })
     }
 
@@ -638,6 +689,7 @@ impl Net {
             acked_features: self.common.acked_features,
             config: self.config,
             queue_size: self.common.queue_sizes.clone(),
+            active_pairs: Some(self.kernel_active_pairs.load(Ordering::Acquire)),
         }
     }
 
@@ -704,6 +756,29 @@ impl VirtioDevice for Net {
         let qp_threads = (num_queues - ctrl_threads) / 2;
         self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
 
+        // Default to one attached tap queue pair per virtio 1.0+
+        // §5.1.6.5.5 (multiqueue disabled until the guest enables it).
+        // Restores deviate: a snapshot that recorded its active pair
+        // count is replayed at that count, and a pre-Rev-G snapshot
+        // (no recorded count) falls back to leaving every tap attached
+        // -- matching the broken-but-multi-queue-preserving behavior
+        // of the CH version that wrote the snapshot, so the upgrade
+        // doesn't silently lose pairs. The target is reset to
+        // `ColdBoot` so reset/re-activate cycles inside the restored
+        // VM go through the spec-correct one-pair path.
+        let target_pairs = match self.next_activation_target {
+            ActivationTarget::ColdBoot => 1,
+            ActivationTarget::LegacyRestore => self.taps.len() as u16,
+            ActivationTarget::RestoreWith(n) => n,
+        };
+        self.next_activation_target = ActivationTarget::ColdBoot;
+        TapMqBackend::new(self.taps.clone(), self.kernel_active_pairs.clone())
+            .set_active_pairs(target_pairs)
+            .map_err(|e| {
+                error!("Failed to align tap queues to {target_pairs} active pair(s): {e}");
+                ActivateError::BadActivate
+            })?;
+
         if has_ctrl_queue {
             let ctrl_queue_index = num_queues - 1;
             let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
@@ -715,7 +790,15 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone()),
+                ctrl_q: CtrlQueue::new(
+                    self.taps.clone(),
+                    Some(Box::new(TapMqBackend::new(
+                        self.taps.clone(),
+                        self.kernel_active_pairs.clone(),
+                    ))),
+                    self.taps.len() as u16,
+                    self.common.feature_acked(VIRTIO_NET_F_MQ.into()),
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform(),

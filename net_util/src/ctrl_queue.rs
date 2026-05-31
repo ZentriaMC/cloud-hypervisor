@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+
 use log::{debug, error, info, warn};
 use thiserror::Error;
 use virtio_bindings::virtio_net::{
@@ -18,7 +21,7 @@ use vm_memory::{ByteValued, Bytes, GuestMemoryError};
 use vm_virtio::{AccessPlatform, Translatable};
 
 use super::virtio_features_to_tap_offload;
-use crate::{GuestMemoryMmap, Tap};
+use crate::{GuestMemoryMmap, Tap, TapError};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -77,13 +80,132 @@ fn is_tolerated_ctrl_command(ctrl_hdr: ControlHeader) -> bool {
     }
 }
 
+/// Error returned by an [`MqBackend`].
+///
+/// Variants exist so net_util-internal backends (taps) can surface their
+/// native error type; backends defined outside this crate (e.g. vhost-user
+/// in `virtio-devices`) erase their error into a string so net_util stays
+/// free of cross-crate dependencies.
+#[derive(Error, Debug)]
+pub enum MqBackendError {
+    #[error("tap error: {0}")]
+    Tap(#[from] TapError),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Strategy for honoring `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`.
+///
+/// Implementations translate "active queue-pair count" to whatever the
+/// underlying backend needs: `TUNSETQUEUE` for kernel taps,
+/// `VHOST_USER_SET_VRING_ENABLE` for vhost-user, etc. The caller (the
+/// `CtrlQueue` MQ handler, or device activation) bounds `pairs` against
+/// the device's advertised max before invoking.
+pub trait MqBackend: Send {
+    fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError>;
+}
+
+/// `MqBackend` for the local kernel-tap path. Holds a shared tracker so
+/// state survives `CtrlQueue` reconstruction across reset/re-activate
+/// cycles and never re-issues `TUNSETQUEUE` on a queue already in the
+/// requested state (which the kernel would reject with `EINVAL`).
+pub struct TapMqBackend {
+    taps: Vec<Tap>,
+    tracker: Arc<AtomicU16>,
+}
+
+impl TapMqBackend {
+    pub fn new(taps: Vec<Tap>, tracker: Arc<AtomicU16>) -> Self {
+        Self { taps, tracker }
+    }
+}
+
+impl MqBackend for TapMqBackend {
+    fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError> {
+        Ok(align_kernel_queue_pairs(&self.taps, &self.tracker, pairs)?)
+    }
+}
+
 pub struct CtrlQueue {
     pub taps: Vec<Tap>,
+    /// Strategy for applying `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`. `None`
+    /// rejects the command -- only happens for net configurations that
+    /// have no working MQ backend at all, which should be rare.
+    mq_backend: Option<Box<dyn MqBackend>>,
+    /// Maximum queue pairs the device exposes. Bounds the requested count
+    /// in addition to the spec's `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN/MAX`.
+    max_queue_pairs: u16,
+    /// Whether `VIRTIO_NET_F_MQ` was acknowledged by the driver. Captured
+    /// at activation time, after feature negotiation has settled.
+    mq_negotiated: bool,
+}
+
+/// Returns the ordered list of `(queue_index, attach)` ops needed to drive
+/// `active` to `desired`, clamped to `max`. Detaches walk from the top down
+/// so a partial failure leaves a contiguous prefix of attached queues.
+fn plan_queue_pair_delta(active: u16, desired: u16, max: u16) -> Vec<(usize, bool)> {
+    if max <= 1 {
+        return Vec::new();
+    }
+    let desired = desired.min(max);
+    if desired == active {
+        return Vec::new();
+    }
+    if desired > active {
+        (active..desired).map(|i| (i as usize, true)).collect()
+    } else {
+        (desired..active)
+            .rev()
+            .map(|i| (i as usize, false))
+            .collect()
+    }
+}
+
+/// Drive the kernel-side multi-queue attachment for `taps` to `desired`
+/// pair count, updating `tracker` incrementally so a partial failure
+/// leaves it in sync with kernel state.
+fn align_kernel_queue_pairs(
+    taps: &[Tap],
+    tracker: &AtomicU16,
+    desired: u16,
+) -> std::result::Result<(), TapError> {
+    let max = taps.len() as u16;
+    let active = tracker.load(Ordering::Acquire);
+    for (idx, attach) in plan_queue_pair_delta(active, desired, max) {
+        taps[idx].set_queue(attach)?;
+        let new_active = if attach { idx as u16 + 1 } else { idx as u16 };
+        tracker.store(new_active, Ordering::Release);
+    }
+    Ok(())
 }
 
 impl CtrlQueue {
-    pub fn new(taps: Vec<Tap>) -> Self {
-        CtrlQueue { taps }
+    pub fn new(
+        taps: Vec<Tap>,
+        mq_backend: Option<Box<dyn MqBackend>>,
+        max_queue_pairs: u16,
+        mq_negotiated: bool,
+    ) -> Self {
+        CtrlQueue {
+            taps,
+            mq_backend,
+            max_queue_pairs,
+            mq_negotiated,
+        }
+    }
+
+    /// Drive the backend to `desired` queue-pair count, or report no
+    /// backend was wired (which becomes `VIRTIO_NET_ERR` to the guest).
+    fn apply_active_queue_pairs(
+        &mut self,
+        desired: u16,
+    ) -> std::result::Result<(), MqBackendError> {
+        let Some(backend) = self.mq_backend.as_mut() else {
+            return Err(MqBackendError::Other(
+                "no MQ backend configured for this device".into(),
+            ));
+        };
+        backend.set_active_pairs(desired)
     }
 
     pub fn process(
@@ -122,14 +244,30 @@ impl CtrlQueue {
                     if u32::from(ctrl_hdr.cmd) != VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET {
                         warn!("Unsupported command: {}", ctrl_hdr.cmd);
                         false
+                    } else if !self.mq_negotiated {
+                        warn!("MQ command received without VIRTIO_NET_F_MQ negotiated");
+                        false
                     } else if (queue_pairs < VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN as u16)
                         || (queue_pairs > VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX as u16)
+                        || (queue_pairs > self.max_queue_pairs)
                     {
-                        warn!("Number of MQ pairs out of range: {queue_pairs}");
+                        warn!(
+                            "Number of MQ pairs out of range: {queue_pairs} \
+                             (device max {})",
+                            self.max_queue_pairs
+                        );
                         false
                     } else {
-                        info!("Number of MQ pairs requested: {queue_pairs}");
-                        true
+                        match self.apply_active_queue_pairs(queue_pairs) {
+                            Ok(()) => {
+                                info!("Number of MQ pairs set: {queue_pairs}");
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to apply MQ pairs={queue_pairs}: {e}");
+                                false
+                            }
+                        }
                     }
                 }
                 VIRTIO_NET_CTRL_GUEST_OFFLOADS => {
@@ -189,5 +327,90 @@ impl CtrlQueue {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn delta_single_queue_device_is_noop() {
+        assert!(plan_queue_pair_delta(1, 1, 1).is_empty());
+        assert!(plan_queue_pair_delta(0, 4, 1).is_empty());
+    }
+
+    #[test]
+    fn delta_same_count_is_noop() {
+        assert!(plan_queue_pair_delta(3, 3, 8).is_empty());
+    }
+
+    #[test]
+    fn delta_grow_attaches_upper_indices() {
+        assert_eq!(
+            plan_queue_pair_delta(1, 4, 8),
+            vec![(1, true), (2, true), (3, true)],
+        );
+    }
+
+    #[test]
+    fn delta_shrink_detaches_from_top_down() {
+        assert_eq!(
+            plan_queue_pair_delta(4, 1, 8),
+            vec![(3, false), (2, false), (1, false)],
+        );
+    }
+
+    #[test]
+    fn delta_clamps_desired_to_device_max() {
+        assert_eq!(plan_queue_pair_delta(2, 99, 4), vec![(2, true), (3, true)],);
+    }
+
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockBackendInner {
+        last_pairs: Option<u16>,
+        fail: bool,
+    }
+
+    #[derive(Default, Clone)]
+    struct MockBackend(Arc<Mutex<MockBackendInner>>);
+
+    impl MqBackend for MockBackend {
+        fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError> {
+            let mut inner = self.0.lock().unwrap();
+            inner.last_pairs = Some(pairs);
+            if inner.fail {
+                Err(MqBackendError::Other("mock fail".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_queue_routes_apply_to_backend() {
+        let mock = MockBackend::default();
+        let inner = mock.0.clone();
+        let mut cq = CtrlQueue::new(Vec::new(), Some(Box::new(mock)), 4, true);
+        cq.apply_active_queue_pairs(3).unwrap();
+        assert_eq!(inner.lock().unwrap().last_pairs, Some(3));
+    }
+
+    #[test]
+    fn ctrl_queue_propagates_backend_failure() {
+        let mock = MockBackend::default();
+        mock.0.lock().unwrap().fail = true;
+        let mut cq = CtrlQueue::new(Vec::new(), Some(Box::new(mock)), 4, true);
+        let err = cq.apply_active_queue_pairs(3).unwrap_err();
+        assert!(matches!(err, MqBackendError::Other(_)));
+    }
+
+    #[test]
+    fn ctrl_queue_with_no_backend_rejects_apply() {
+        let mut cq = CtrlQueue::new(Vec::new(), None, 4, true);
+        let err = cq.apply_active_queue_pairs(3).unwrap_err();
+        assert!(matches!(err, MqBackendError::Other(_)));
     }
 }
