@@ -240,7 +240,10 @@ fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 }
 
 fn virtio_vhost_net_ctl_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
-    vec![]
+    // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET handling sends
+    // VHOST_USER_SET_VRING_ENABLE to the backend over the vhost-user
+    // socket and (when REPLY_ACK is negotiated) reads the ack back.
+    vec![(libc::SYS_recvmsg, vec![]), (libc::SYS_sendmsg, vec![])]
 }
 
 fn virtio_vhost_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
