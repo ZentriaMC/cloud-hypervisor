@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use block::{BLKDISCARD, BLKZEROOUT};
-use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD};
+use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD, TUNSETQUEUE};
 use seccompiler::SeccompCmpOp::Eq;
 use seccompiler::{
     BpfProgram, Error, SeccompAction, SeccompCmpArgLen as ArgLen, SeccompCondition as Cond,
@@ -175,6 +175,7 @@ fn virtio_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 fn create_virtio_net_ctl_ioctl_seccomp_rule() -> Vec<SeccompRule> {
     or![
         and![Cond::new(1, ArgLen::Dword, Eq, TUNSETOFFLOAD as _).unwrap()],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNSETQUEUE as _).unwrap()],
         #[cfg(feature = "sev_snp")]
         mshv_sev_snp_ioctl_seccomp_rule(),
     ]
@@ -239,7 +240,10 @@ fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
 }
 
 fn virtio_vhost_net_ctl_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
-    vec![]
+    // VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET handling sends
+    // VHOST_USER_SET_VRING_ENABLE to the backend over the vhost-user
+    // socket and (when REPLY_ACK is negotiated) reads the ack back.
+    vec![(libc::SYS_recvmsg, vec![]), (libc::SYS_sendmsg, vec![])]
 }
 
 fn virtio_vhost_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
