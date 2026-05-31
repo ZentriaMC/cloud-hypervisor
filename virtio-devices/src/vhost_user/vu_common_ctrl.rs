@@ -301,12 +301,19 @@ impl VhostUserHandle {
 
     fn enable_vhost_user_vrings(&mut self, queue_indexes: Vec<usize>, enable: bool) -> Result<()> {
         for queue_index in queue_indexes {
-            self.vu
-                .set_vring_enable(queue_index, enable)
-                .map_err(Error::VhostUserSetVringEnable)?;
+            self.set_vring_enable(queue_index, enable)?;
         }
 
         Ok(())
+    }
+
+    /// Toggle a single vring on the backend. Exposed for handlers that
+    /// need to flip queue activation at runtime (e.g. honoring
+    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`).
+    pub fn set_vring_enable(&mut self, queue_index: usize, enable: bool) -> Result<()> {
+        self.vu
+            .set_vring_enable(queue_index, enable)
+            .map_err(Error::VhostUserSetVringEnable)
     }
 
     pub fn reset_vhost_user(&mut self) -> Result<()> {

@@ -6,7 +6,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::{result, thread};
 
 use log::{error, info};
-use net_util::{CtrlQueue, MacAddr, VirtioNetConfig, build_net_config_space};
+use net_util::{
+    CtrlQueue, MacAddr, MqBackend, MqBackendError, VirtioNetConfig, build_net_config_space,
+};
 use seccompiler::SeccompAction;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
@@ -38,6 +40,40 @@ pub type State = VhostUserState<VirtioNetConfig>;
 
 struct BackendReqHandler {}
 impl VhostUserFrontendReqHandler for BackendReqHandler {}
+
+/// `MqBackend` for vhost-user net. Translates an active queue-pair count
+/// into per-data-vring `VHOST_USER_SET_VRING_ENABLE` calls on the backend.
+/// The control queue (when present) sits beyond the data vrings and is
+/// not touched here.
+struct VhostUserMqBackend {
+    vu: Arc<Mutex<VhostUserHandle>>,
+    /// Total data vrings the device exposes (= `max_queue_pairs * 2`).
+    data_vring_count: usize,
+}
+
+impl VhostUserMqBackend {
+    fn new(vu: Arc<Mutex<VhostUserHandle>>, data_vring_count: usize) -> Self {
+        Self {
+            vu,
+            data_vring_count,
+        }
+    }
+}
+
+impl MqBackend for VhostUserMqBackend {
+    fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError> {
+        let active_data = (pairs as usize) * 2;
+        let mut vu = self
+            .vu
+            .lock()
+            .map_err(|e| MqBackendError::Other(format!("vhost-user handle poisoned: {e}")))?;
+        for q in 0..self.data_vring_count {
+            vu.set_vring_enable(q, q < active_data)
+                .map_err(|e| MqBackendError::Other(format!("set_vring_enable({q}): {e}")))?;
+        }
+        Ok(())
+    }
+}
 
 pub struct Net {
     vu_common: VhostUserCommon,
@@ -305,13 +341,17 @@ impl VirtioDevice for Net {
                 .vu_common
                 .virtio_common
                 .feature_acked(VIRTIO_NET_F_MQ.into());
+            let mq_backend: Option<Box<dyn MqBackend>> = self.vu_common.vu.as_ref().map(|vu| {
+                Box::new(VhostUserMqBackend::new(
+                    vu.clone(),
+                    self.vu_common.vu_num_queues,
+                )) as Box<dyn MqBackend>
+            });
             let mut ctrl_handler = NetCtrlEpollHandler {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                // vhost-user owns no local taps; the backend handles queue
-                // selection via its own protocol, so we pass no tracker.
-                ctrl_q: CtrlQueue::new(Vec::new(), None, max_queue_pairs, mq_negotiated),
+                ctrl_q: CtrlQueue::new(Vec::new(), mq_backend, max_queue_pairs, mq_negotiated),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,

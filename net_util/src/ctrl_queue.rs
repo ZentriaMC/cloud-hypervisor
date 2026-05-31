@@ -80,17 +80,58 @@ fn is_tolerated_ctrl_command(ctrl_hdr: ControlHeader) -> bool {
     }
 }
 
+/// Error returned by an [`MqBackend`].
+///
+/// Variants exist so net_util-internal backends (taps) can surface their
+/// native error type; backends defined outside this crate (e.g. vhost-user
+/// in `virtio-devices`) erase their error into a string so net_util stays
+/// free of cross-crate dependencies.
+#[derive(Error, Debug)]
+pub enum MqBackendError {
+    #[error("tap error: {0}")]
+    Tap(#[from] TapError),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Strategy for honoring `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`.
+///
+/// Implementations translate "active queue-pair count" to whatever the
+/// underlying backend needs: `TUNSETQUEUE` for kernel taps,
+/// `VHOST_USER_SET_VRING_ENABLE` for vhost-user, etc. The caller (the
+/// `CtrlQueue` MQ handler, or device activation) bounds `pairs` against
+/// the device's advertised max before invoking.
+pub trait MqBackend: Send {
+    fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError>;
+}
+
+/// `MqBackend` for the local kernel-tap path. Holds a shared tracker so
+/// state survives `CtrlQueue` reconstruction across reset/re-activate
+/// cycles and never re-issues `TUNSETQUEUE` on a queue already in the
+/// requested state (which the kernel would reject with `EINVAL`).
+pub struct TapMqBackend {
+    taps: Vec<Tap>,
+    tracker: Arc<AtomicU16>,
+}
+
+impl TapMqBackend {
+    pub fn new(taps: Vec<Tap>, tracker: Arc<AtomicU16>) -> Self {
+        Self { taps, tracker }
+    }
+}
+
+impl MqBackend for TapMqBackend {
+    fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError> {
+        Ok(align_kernel_queue_pairs(&self.taps, &self.tracker, pairs)?)
+    }
+}
+
 pub struct CtrlQueue {
     pub taps: Vec<Tap>,
-    /// Number of RX/TX queue pairs currently attached to the underlying
-    /// multi-queue tun. Shared with the owning `Net` device so the tracker
-    /// survives reset/re-activate cycles and matches actual kernel state.
-    ///
-    /// `None` for backends that do not own local taps (e.g. vhost-user),
-    /// where `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` is acknowledged with no
-    /// local effect -- the backend is expected to manage queue activation
-    /// out-of-band. FIXME: forward the command to vhost-user backends.
-    active_queue_pairs: Option<Arc<AtomicU16>>,
+    /// Strategy for applying `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`. `None`
+    /// rejects the command -- only happens for net configurations that
+    /// have no working MQ backend at all, which should be rare.
+    mq_backend: Option<Box<dyn MqBackend>>,
     /// Maximum queue pairs the device exposes. Bounds the requested count
     /// in addition to the spec's `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN/MAX`.
     max_queue_pairs: u16,
@@ -123,11 +164,7 @@ fn plan_queue_pair_delta(active: u16, desired: u16, max: u16) -> Vec<(usize, boo
 /// Drive the kernel-side multi-queue attachment for `taps` to `desired`
 /// pair count, updating `tracker` incrementally so a partial failure
 /// leaves it in sync with kernel state.
-///
-/// Used both by the control-queue handler in response to
-/// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` and by device activation to align
-/// kernel attachment with the queue pairs the guest is about to use.
-pub fn align_kernel_queue_pairs(
+fn align_kernel_queue_pairs(
     taps: &[Tap],
     tracker: &AtomicU16,
     desired: u16,
@@ -145,28 +182,30 @@ pub fn align_kernel_queue_pairs(
 impl CtrlQueue {
     pub fn new(
         taps: Vec<Tap>,
-        active_queue_pairs: Option<Arc<AtomicU16>>,
+        mq_backend: Option<Box<dyn MqBackend>>,
         max_queue_pairs: u16,
         mq_negotiated: bool,
     ) -> Self {
         CtrlQueue {
             taps,
-            active_queue_pairs,
+            mq_backend,
             max_queue_pairs,
             mq_negotiated,
         }
     }
 
-    /// Drive the kernel-side multi-queue attachment to `desired` pair count.
-    ///
-    /// No-op when this `CtrlQueue` does not own local taps (vhost-user) or
-    /// when the tap is single-queue (`TUNSETQUEUE` would `EINVAL`).
-    fn apply_active_queue_pairs(&mut self, desired: u16) -> std::result::Result<(), TapError> {
-        let Some(tracker) = self.active_queue_pairs.as_ref() else {
-            debug!("MQ_VQ_PAIRS_SET={desired} acknowledged without local effect");
-            return Ok(());
+    /// Drive the backend to `desired` queue-pair count, or report no
+    /// backend was wired (which becomes `VIRTIO_NET_ERR` to the guest).
+    fn apply_active_queue_pairs(
+        &mut self,
+        desired: u16,
+    ) -> std::result::Result<(), MqBackendError> {
+        let Some(backend) = self.mq_backend.as_mut() else {
+            return Err(MqBackendError::Other(
+                "no MQ backend configured for this device".into(),
+            ));
         };
-        align_kernel_queue_pairs(&self.taps, tracker, desired)
+        backend.set_active_pairs(desired)
     }
 
     pub fn process(
