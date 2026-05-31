@@ -21,7 +21,8 @@ use log::{debug, error, info, warn};
 use net_util::virtio_features_to_tap_offload;
 use net_util::{
     CtrlQueue, MacAddr, NetCounters, NetQueuePair, OpenTapError, RxVirtio, Tap, TapError, TxVirtio,
-    VirtioNetConfig, build_net_config_space, build_net_config_space_with_mq, open_tap,
+    VirtioNetConfig, align_kernel_queue_pairs, build_net_config_space,
+    build_net_config_space_with_mq, open_tap,
 };
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
@@ -409,10 +410,11 @@ pub struct Net {
     /// Number of queue pairs currently attached to the underlying
     /// multi-queue tun. `open_tap`/`from_tap_fd` start with every tap
     /// kernel-attached via `IFF_MULTI_QUEUE`, so the initial value matches
-    /// `taps.len()`. Shared with the spawned `CtrlQueue` worker so that
-    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` survives reset/re-activate cycles
-    /// without re-issuing `TUNSETQUEUE` on queues already in the requested
-    /// state (which the kernel would reject with `EINVAL`).
+    /// `taps.len()`. `activate()` then drives it down to one, and the
+    /// spawned `CtrlQueue` worker grows it back in response to
+    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`. Sharing the tracker keeps both
+    /// ends from re-issuing `TUNSETQUEUE` on queues already in the
+    /// requested state, which the kernel would reject with `EINVAL`.
     kernel_active_pairs: Arc<AtomicU16>,
 }
 
@@ -713,6 +715,18 @@ impl VirtioDevice for Net {
         let ctrl_threads = if has_ctrl_queue { 1 } else { 0 };
         let qp_threads = (num_queues - ctrl_threads) / 2;
         self.common.paused_sync = Some(Arc::new(Barrier::new(1 + qp_threads + ctrl_threads)));
+
+        // Start each activation with one attached tap queue pair, matching
+        // QEMU's virtio-net model. Multi-queue guests negotiate
+        // VIRTIO_NET_F_MQ and grow the count via VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET;
+        // this also covers single-queue drivers that never negotiate F_MQ,
+        // where leaving all taps attached would otherwise let the kernel
+        // steer RX to queues with no userspace reader (silently dropping
+        // hashed traffic at the tap).
+        align_kernel_queue_pairs(&self.taps, &self.kernel_active_pairs, 1).map_err(|e| {
+            error!("Failed to align tap queues to single active pair: {e}");
+            ActivateError::BadActivate
+        })?;
 
         if has_ctrl_queue {
             let ctrl_queue_index = num_queues - 1;
