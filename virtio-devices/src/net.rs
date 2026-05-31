@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{result, thread};
 
@@ -406,6 +406,14 @@ pub struct Net {
     rate_limiter_config: Option<RateLimiterConfig>,
     exit_evt: EventFd,
     device_status: Arc<AtomicU8>,
+    /// Number of queue pairs currently attached to the underlying
+    /// multi-queue tun. `open_tap`/`from_tap_fd` start with every tap
+    /// kernel-attached via `IFF_MULTI_QUEUE`, so the initial value matches
+    /// `taps.len()`. Shared with the spawned `CtrlQueue` worker so that
+    /// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` survives reset/re-activate cycles
+    /// without re-issuing `TUNSETQUEUE` on queues already in the requested
+    /// state (which the kernel would reject with `EINVAL`).
+    kernel_active_pairs: Arc<AtomicU16>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -506,6 +514,7 @@ impl Net {
             )
         };
 
+        let kernel_active_pairs = Arc::new(AtomicU16::new(taps.len() as u16));
         Ok(Net {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Net as u32,
@@ -526,6 +535,7 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             device_status: Arc::new(AtomicU8::new(0)),
+            kernel_active_pairs,
         })
     }
 
@@ -715,7 +725,12 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone()),
+                ctrl_q: CtrlQueue::new(
+                    self.taps.clone(),
+                    Some(self.kernel_active_pairs.clone()),
+                    self.taps.len() as u16,
+                    self.common.feature_acked(VIRTIO_NET_F_MQ.into()),
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform(),

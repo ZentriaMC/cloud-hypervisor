@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+
 use log::{debug, error, info, warn};
 use thiserror::Error;
 use virtio_bindings::virtio_net::{
@@ -18,7 +21,7 @@ use vm_memory::{ByteValued, Bytes, GuestMemoryError};
 use vm_virtio::{AccessPlatform, Translatable};
 
 use super::virtio_features_to_tap_offload;
-use crate::{GuestMemoryMmap, Tap};
+use crate::{GuestMemoryMmap, Tap, TapError};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -79,11 +82,91 @@ fn is_tolerated_ctrl_command(ctrl_hdr: ControlHeader) -> bool {
 
 pub struct CtrlQueue {
     pub taps: Vec<Tap>,
+    /// Number of RX/TX queue pairs currently attached to the underlying
+    /// multi-queue tun. Shared with the owning `Net` device so the tracker
+    /// survives reset/re-activate cycles and matches actual kernel state.
+    ///
+    /// `None` for backends that do not own local taps (e.g. vhost-user),
+    /// where `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` is acknowledged with no
+    /// local effect -- the backend is expected to manage queue activation
+    /// out-of-band. FIXME: forward the command to vhost-user backends.
+    active_queue_pairs: Option<Arc<AtomicU16>>,
+    /// Maximum queue pairs the device exposes. Bounds the requested count
+    /// in addition to the spec's `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN/MAX`.
+    max_queue_pairs: u16,
+    /// Whether `VIRTIO_NET_F_MQ` was acknowledged by the driver. Captured
+    /// at activation time, after feature negotiation has settled.
+    mq_negotiated: bool,
+}
+
+/// Returns the ordered list of `(queue_index, attach)` ops needed to drive
+/// `active` to `desired`, clamped to `max`. Detaches walk from the top down
+/// so a partial failure leaves a contiguous prefix of attached queues.
+fn plan_queue_pair_delta(active: u16, desired: u16, max: u16) -> Vec<(usize, bool)> {
+    if max <= 1 {
+        return Vec::new();
+    }
+    let desired = desired.min(max);
+    if desired == active {
+        return Vec::new();
+    }
+    if desired > active {
+        (active..desired).map(|i| (i as usize, true)).collect()
+    } else {
+        (desired..active)
+            .rev()
+            .map(|i| (i as usize, false))
+            .collect()
+    }
+}
+
+/// Drive the kernel-side multi-queue attachment for `taps` to `desired`
+/// pair count, updating `tracker` incrementally so a partial failure
+/// leaves it in sync with kernel state.
+///
+/// Used both by the control-queue handler in response to
+/// `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET` and by device activation to align
+/// kernel attachment with the queue pairs the guest is about to use.
+pub fn align_kernel_queue_pairs(
+    taps: &[Tap],
+    tracker: &AtomicU16,
+    desired: u16,
+) -> std::result::Result<(), TapError> {
+    let max = taps.len() as u16;
+    let active = tracker.load(Ordering::Acquire);
+    for (idx, attach) in plan_queue_pair_delta(active, desired, max) {
+        taps[idx].set_queue(attach)?;
+        let new_active = if attach { idx as u16 + 1 } else { idx as u16 };
+        tracker.store(new_active, Ordering::Release);
+    }
+    Ok(())
 }
 
 impl CtrlQueue {
-    pub fn new(taps: Vec<Tap>) -> Self {
-        CtrlQueue { taps }
+    pub fn new(
+        taps: Vec<Tap>,
+        active_queue_pairs: Option<Arc<AtomicU16>>,
+        max_queue_pairs: u16,
+        mq_negotiated: bool,
+    ) -> Self {
+        CtrlQueue {
+            taps,
+            active_queue_pairs,
+            max_queue_pairs,
+            mq_negotiated,
+        }
+    }
+
+    /// Drive the kernel-side multi-queue attachment to `desired` pair count.
+    ///
+    /// No-op when this `CtrlQueue` does not own local taps (vhost-user) or
+    /// when the tap is single-queue (`TUNSETQUEUE` would `EINVAL`).
+    fn apply_active_queue_pairs(&mut self, desired: u16) -> std::result::Result<(), TapError> {
+        let Some(tracker) = self.active_queue_pairs.as_ref() else {
+            debug!("MQ_VQ_PAIRS_SET={desired} acknowledged without local effect");
+            return Ok(());
+        };
+        align_kernel_queue_pairs(&self.taps, tracker, desired)
     }
 
     pub fn process(
@@ -122,14 +205,30 @@ impl CtrlQueue {
                     if u32::from(ctrl_hdr.cmd) != VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET {
                         warn!("Unsupported command: {}", ctrl_hdr.cmd);
                         false
+                    } else if !self.mq_negotiated {
+                        warn!("MQ command received without VIRTIO_NET_F_MQ negotiated");
+                        false
                     } else if (queue_pairs < VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN as u16)
                         || (queue_pairs > VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX as u16)
+                        || (queue_pairs > self.max_queue_pairs)
                     {
-                        warn!("Number of MQ pairs out of range: {queue_pairs}");
+                        warn!(
+                            "Number of MQ pairs out of range: {queue_pairs} \
+                             (device max {})",
+                            self.max_queue_pairs
+                        );
                         false
                     } else {
-                        info!("Number of MQ pairs requested: {queue_pairs}");
-                        true
+                        match self.apply_active_queue_pairs(queue_pairs) {
+                            Ok(()) => {
+                                info!("Number of MQ pairs set: {queue_pairs}");
+                                true
+                            }
+                            Err(e) => {
+                                error!("Failed to apply MQ pairs={queue_pairs}: {e}");
+                                false
+                            }
+                        }
                     }
                 }
                 VIRTIO_NET_CTRL_GUEST_OFFLOADS => {
@@ -189,5 +288,42 @@ impl CtrlQueue {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn delta_single_queue_device_is_noop() {
+        assert!(plan_queue_pair_delta(1, 1, 1).is_empty());
+        assert!(plan_queue_pair_delta(0, 4, 1).is_empty());
+    }
+
+    #[test]
+    fn delta_same_count_is_noop() {
+        assert!(plan_queue_pair_delta(3, 3, 8).is_empty());
+    }
+
+    #[test]
+    fn delta_grow_attaches_upper_indices() {
+        assert_eq!(
+            plan_queue_pair_delta(1, 4, 8),
+            vec![(1, true), (2, true), (3, true)],
+        );
+    }
+
+    #[test]
+    fn delta_shrink_detaches_from_top_down() {
+        assert_eq!(
+            plan_queue_pair_delta(4, 1, 8),
+            vec![(3, false), (2, false), (1, false)],
+        );
+    }
+
+    #[test]
+    fn delta_clamps_desired_to_device_max() {
+        assert_eq!(plan_queue_pair_delta(2, 99, 4), vec![(2, true), (3, true)],);
     }
 }
