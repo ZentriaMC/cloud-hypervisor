@@ -365,4 +365,52 @@ mod unit_tests {
     fn delta_clamps_desired_to_device_max() {
         assert_eq!(plan_queue_pair_delta(2, 99, 4), vec![(2, true), (3, true)],);
     }
+
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockBackendInner {
+        last_pairs: Option<u16>,
+        fail: bool,
+    }
+
+    #[derive(Default, Clone)]
+    struct MockBackend(Arc<Mutex<MockBackendInner>>);
+
+    impl MqBackend for MockBackend {
+        fn set_active_pairs(&mut self, pairs: u16) -> std::result::Result<(), MqBackendError> {
+            let mut inner = self.0.lock().unwrap();
+            inner.last_pairs = Some(pairs);
+            if inner.fail {
+                Err(MqBackendError::Other("mock fail".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_queue_routes_apply_to_backend() {
+        let mock = MockBackend::default();
+        let inner = mock.0.clone();
+        let mut cq = CtrlQueue::new(Vec::new(), Some(Box::new(mock)), 4, true);
+        cq.apply_active_queue_pairs(3).unwrap();
+        assert_eq!(inner.lock().unwrap().last_pairs, Some(3));
+    }
+
+    #[test]
+    fn ctrl_queue_propagates_backend_failure() {
+        let mock = MockBackend::default();
+        mock.0.lock().unwrap().fail = true;
+        let mut cq = CtrlQueue::new(Vec::new(), Some(Box::new(mock)), 4, true);
+        let err = cq.apply_active_queue_pairs(3).unwrap_err();
+        assert!(matches!(err, MqBackendError::Other(_)));
+    }
+
+    #[test]
+    fn ctrl_queue_with_no_backend_rejects_apply() {
+        let mut cq = CtrlQueue::new(Vec::new(), None, 4, true);
+        let err = cq.apply_active_queue_pairs(3).unwrap_err();
+        assert!(matches!(err, MqBackendError::Other(_)));
+    }
 }
