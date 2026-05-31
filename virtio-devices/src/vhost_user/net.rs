@@ -14,7 +14,7 @@ use virtio_bindings::virtio_net::{
     VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_ECN,
     VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
     VIRTIO_NET_F_HOST_ECN, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU,
+    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MQ, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU,
 };
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::QueueT;
@@ -300,11 +300,18 @@ impl VirtioDevice for Net {
 
             let (kill_evt, pause_evt) = self.vu_common.virtio_common.dup_eventfds();
 
+            let max_queue_pairs = (self.vu_common.vu_num_queues / 2) as u16;
+            let mq_negotiated = self
+                .vu_common
+                .virtio_common
+                .feature_acked(VIRTIO_NET_F_MQ.into());
             let mut ctrl_handler = NetCtrlEpollHandler {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(Vec::new()),
+                // vhost-user owns no local taps; the backend handles queue
+                // selection via its own protocol, so we pass no tracker.
+                ctrl_q: CtrlQueue::new(Vec::new(), None, max_queue_pairs, mq_negotiated),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,
